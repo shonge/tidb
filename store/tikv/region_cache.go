@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/pingcap/tidb/store/helper"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -279,6 +280,22 @@ type RegionCache struct {
 		regions      map[RegionVerID]*Region // cached regions be organized as regionVerID to region ref mapping
 		sorted       *btree.BTree            // cache regions be organized as sorted key to region ref mapping
 	}
+
+	hotMu struct {
+		sync.RWMutex
+		hotReadRegions helper.StoreHotRegionInfos
+	}
+
+	ssMu struct {
+		sync.RWMutex
+		storesStat helper.StoresStat
+	}
+
+	regionInfoMu struct {
+		sync.RWMutex
+		regionsInfo map[uint64]helper.RegionInfo
+	}
+
 	storeMu struct {
 		sync.RWMutex
 		stores map[uint64]*Store
@@ -294,12 +311,33 @@ func NewRegionCache(pdClient pd.Client) *RegionCache {
 	}
 	c.mu.regions = make(map[RegionVerID]*Region)
 	c.mu.sorted = btree.New(btreeDegree)
+	c.regionInfoMu.regionsInfo = make(map[uint64]helper.RegionInfo)
 	c.storeMu.stores = make(map[uint64]*Store)
 	c.notifyCheckCh = make(chan struct{}, 1)
 	c.closeCh = make(chan struct{})
 	interval := config.GetGlobalConfig().StoresRefreshInterval
 	go c.asyncCheckAndResolveLoop(time.Duration(interval) * time.Second)
 	return c
+}
+
+// refresh hot read region
+func (c *RegionCache) RefreshHotRegions(hr helper.StoreHotRegionInfos) {
+	c.hotMu.Lock()
+	c.hotMu.hotReadRegions = hr
+	c.hotMu.Unlock()
+}
+
+// refresh stores stat
+func (c *RegionCache) RefreshStoresStat(ss helper.StoresStat) {
+	c.ssMu.Lock()
+	c.ssMu.storesStat = ss
+	c.ssMu.Unlock()
+}
+
+func (c *RegionCache) InsertRegionInfo(regionID uint64, ri helper.RegionInfo) {
+	c.regionInfoMu.Lock()
+	c.regionInfoMu.regionsInfo[regionID] = ri
+	c.regionInfoMu.Unlock()
 }
 
 // Close releases region cache's resource.
@@ -420,14 +458,16 @@ func (c *RegionCache) GetTiKVRPCContext(bo *Backoffer, id RegionVerID, replicaRe
 	for _, op := range opts {
 		op(options)
 	}
-	switch replicaRead {
-	case kv.ReplicaReadFollower:
+
+	if c.isHotRegion(id) {
 		store, peer, accessIdx, storeIdx = cachedRegion.FollowerStorePeer(regionStore, followerStoreSeed, options)
-	case kv.ReplicaReadMixed:
-		store, peer, accessIdx, storeIdx = cachedRegion.AnyStorePeer(regionStore, followerStoreSeed, options)
-	default:
-		store, peer, accessIdx, storeIdx = cachedRegion.WorkStorePeer(regionStore)
+		if c.isPendingPeer(id.id, peer) {
+			store, peer, accessIdx, storeIdx = cachedRegion.WorkStorePeer(regionStore)
+		}
 	}
+	// TODO store stat strategy.
+	store, peer, accessIdx, storeIdx = cachedRegion.WorkStorePeer(regionStore)
+
 	addr, err := c.getStoreAddr(bo, cachedRegion, store, storeIdx)
 	if err != nil {
 		return nil, err
@@ -462,6 +502,27 @@ func (c *RegionCache) GetTiKVRPCContext(bo *Backoffer, id RegionVerID, replicaRe
 		Addr:       addr,
 		AccessMode: TiKvOnly,
 	}, nil
+}
+
+func (c *RegionCache) isHotRegion(id RegionVerID) bool {
+	c.hotMu.RLock()
+	if _, ok := c.hotMu.hotReadRegions.AsLeader[id.id]; ok {
+		return true
+	}
+	return false
+}
+
+func (c *RegionCache) isPendingPeer(id uint64, peer *metapb.Peer) bool {
+	c.ssMu.RLock()
+	defer c.ssMu.RUnlock()
+	if regionInfo, ok := c.regionInfoMu.regionsInfo[id]; ok {
+		for _, p := range regionInfo.PendingPeers {
+			if uint64(p.ID) == peer.Id {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // GetTiFlashRPCContext returns RPCContext for a region must access flash store. If it returns nil, the region

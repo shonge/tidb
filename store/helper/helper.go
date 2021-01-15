@@ -158,6 +158,7 @@ func (h *Helper) FetchHotRegion(rw string) (map[uint64]RegionMetric, error) {
 			metric[region.RegionID] = RegionMetric{FlowBytes: uint64(region.FlowBytes), MaxHotDegree: region.HotDegree}
 		}
 	}
+	h.RegionCache.RefreshHotRegions(regionResp)
 	return metric, nil
 }
 
@@ -634,6 +635,9 @@ func (h *Helper) GetRegionsInfo() (*RegionsInfo, error) {
 func (h *Helper) GetRegionInfoByID(regionID uint64) (*RegionInfo, error) {
 	var regionInfo RegionInfo
 	err := h.requestPD("GET", pdapi.RegionByID+strconv.FormatUint(regionID, 10), nil, &regionInfo)
+	if err != nil {
+		h.RegionCache.InsertRegionInfo(regionID, regionInfo)
+	}
 	return &regionInfo, err
 }
 
@@ -755,6 +759,8 @@ func (h *Helper) GetStoresStat() (*StoresStat, error) {
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
+
+	h.RegionCache.RefreshStoresStat(storesStat)
 	return &storesStat, nil
 }
 
