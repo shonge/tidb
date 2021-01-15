@@ -17,7 +17,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"github.com/pingcap/tidb/store/helper"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -283,23 +282,19 @@ type RegionCache struct {
 
 	hotMu struct {
 		sync.RWMutex
-		hotReadRegions helper.StoreHotRegionInfos
+		hotReadRegions map[uint64]bool
 	}
 
-	ssMu struct {
+	pendingMu struct {
 		sync.RWMutex
-		storesStat helper.StoresStat
-	}
-
-	regionInfoMu struct {
-		sync.RWMutex
-		regionsInfo map[uint64]helper.RegionInfo
+		regionPendingPeers map[int64][]int64
 	}
 
 	storeMu struct {
 		sync.RWMutex
 		stores map[uint64]*Store
 	}
+
 	notifyCheckCh chan struct{}
 	closeCh       chan struct{}
 }
@@ -311,7 +306,8 @@ func NewRegionCache(pdClient pd.Client) *RegionCache {
 	}
 	c.mu.regions = make(map[RegionVerID]*Region)
 	c.mu.sorted = btree.New(btreeDegree)
-	c.regionInfoMu.regionsInfo = make(map[uint64]helper.RegionInfo)
+	c.hotMu.hotReadRegions = make(map[uint64]bool)
+	c.pendingMu.regionPendingPeers = make(map[int64][]int64)
 	c.storeMu.stores = make(map[uint64]*Store)
 	c.notifyCheckCh = make(chan struct{}, 1)
 	c.closeCh = make(chan struct{})
@@ -321,23 +317,16 @@ func NewRegionCache(pdClient pd.Client) *RegionCache {
 }
 
 // refresh hot read region
-func (c *RegionCache) RefreshHotRegions(hr helper.StoreHotRegionInfos) {
+func (c *RegionCache) RefreshHotReadRegions(hotReadRegions map[uint64]bool) {
 	c.hotMu.Lock()
-	c.hotMu.hotReadRegions = hr
+	c.hotMu.hotReadRegions = hotReadRegions
 	c.hotMu.Unlock()
 }
 
-// refresh stores stat
-func (c *RegionCache) RefreshStoresStat(ss helper.StoresStat) {
-	c.ssMu.Lock()
-	c.ssMu.storesStat = ss
-	c.ssMu.Unlock()
-}
-
-func (c *RegionCache) InsertRegionInfo(regionID uint64, ri helper.RegionInfo) {
-	c.regionInfoMu.Lock()
-	c.regionInfoMu.regionsInfo[regionID] = ri
-	c.regionInfoMu.Unlock()
+func (c *RegionCache) RefreshRegionPendingPeers(pendingPeers map[int64][]int64) {
+	c.pendingMu.Lock()
+	c.pendingMu.regionPendingPeers = pendingPeers
+	c.pendingMu.Unlock()
 }
 
 // Close releases region cache's resource.
@@ -506,18 +495,20 @@ func (c *RegionCache) GetTiKVRPCContext(bo *Backoffer, id RegionVerID, replicaRe
 
 func (c *RegionCache) isHotRegion(id RegionVerID) bool {
 	c.hotMu.RLock()
-	if _, ok := c.hotMu.hotReadRegions.AsLeader[id.id]; ok {
+	defer c.hotMu.RUnlock()
+	if c.hotMu.hotReadRegions[id.id] {
 		return true
 	}
 	return false
 }
 
 func (c *RegionCache) isPendingPeer(id uint64, peer *metapb.Peer) bool {
-	c.ssMu.RLock()
-	defer c.ssMu.RUnlock()
-	if regionInfo, ok := c.regionInfoMu.regionsInfo[id]; ok {
-		for _, p := range regionInfo.PendingPeers {
-			if uint64(p.ID) == peer.Id {
+	c.pendingMu.RLock()
+	defer c.pendingMu.RUnlock()
+	if pendingPeers, ok := c.pendingMu.regionPendingPeers[int64(id)]; ok {
+		peerID := peer.Id
+		for _, pendingPeerID := range pendingPeers {
+			if peerID == uint64(pendingPeerID) {
 				return true
 			}
 		}
