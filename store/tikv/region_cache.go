@@ -451,13 +451,14 @@ func (c *RegionCache) GetTiKVRPCContext(bo *Backoffer, id RegionVerID, replicaRe
 	}
 
 	if c.isHotRegion(id) {
-		logutil.BgLogger().Warn("GetTiKVRPCContext() region is hot", zap.Uint64("region", id.id))
-		store, peer, accessIdx, storeIdx = cachedRegion.AnyStorePeer(regionStore, followerStoreSeed, options)
+		logutil.BgLogger().Warn("GetTiKVRPCContext() region is hot, use follower-read", zap.Uint64("region", id.id))
+		store, peer, accessIdx, storeIdx = cachedRegion.FollowerStorePeer(regionStore, followerStoreSeed, options)
 		if c.isPendingPeer(id.id, peer) {
-			logutil.BgLogger().Warn("GetTiKVRPCContext() peer is pending", zap.Uint64("region", id.id), zap.Uint64("peer", peer.Id))
+			logutil.BgLogger().Warn("GetTiKVRPCContext() peer is pending, use leader-read", zap.Uint64("region", id.id), zap.Uint64("peer", peer.Id))
 			store, peer, accessIdx, storeIdx = cachedRegion.WorkStorePeer(regionStore)
 		}
 	} else {
+		logutil.BgLogger().Info("GetTiKVRPCContext() region is not hot, use leader-read", zap.Uint64("region", id.id))
 		store, peer, accessIdx, storeIdx = cachedRegion.WorkStorePeer(regionStore)
 	}
 
