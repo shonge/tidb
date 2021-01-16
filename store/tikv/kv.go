@@ -16,8 +16,12 @@ package tikv
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
+	"github.com/pingcap/tidb/util"
+	"github.com/pingcap/tidb/util/pdapi"
 	"math/rand"
+	"net/http"
 	"net/url"
 	"strings"
 	"sync"
@@ -226,6 +230,7 @@ func newTikvStore(uuid string, pdClient pd.Client, spkv SafePointKV, client Clie
 	store.coprCache = coprCache
 
 	go store.runSafePointChecker()
+	go store.refreshRegionCache()
 
 	return store, nil
 }
@@ -302,6 +307,180 @@ func (s *tikvStore) StartGCWorker() error {
 	gcWorker.Start()
 	s.gcWorker = gcWorker
 	return nil
+}
+
+// StoreHotRegionInfos records all hog region stores.
+// it's the response of PD.
+type StoreHotRegionInfos struct {
+	AsPeer   map[uint64]*HotRegionsStat `json:"as_peer"`
+	AsLeader map[uint64]*HotRegionsStat `json:"as_leader"`
+}
+
+// HotRegionsStat records echo store's hot region.
+// it's the response of PD.
+type HotRegionsStat struct {
+	RegionsStat []RegionStat `json:"statistics"`
+}
+
+// RegionStat records each hot region's statistics
+// it's the response of PD.
+type RegionStat struct {
+	RegionID  uint64  `json:"region_id"`
+	FlowBytes float64 `json:"flow_bytes"`
+	HotDegree int     `json:"hot_degree"`
+}
+
+// RegionsInfo stores the information of regions.
+type RegionsInfo struct {
+	Count   int64        `json:"count"`
+	Regions []RegionInfo `json:"regions"`
+}
+
+// RegionInfo stores the information of one region.
+type RegionInfo struct {
+	ID              int64            `json:"id"`
+	StartKey        string           `json:"start_key"`
+	EndKey          string           `json:"end_key"`
+	Epoch           RegionEpoch      `json:"epoch"`
+	Peers           []RegionPeer     `json:"peers"`
+	Leader          RegionPeer       `json:"leader"`
+	DownPeers       []RegionPeerStat `json:"down_peers"`
+	PendingPeers    []RegionPeer     `json:"pending_peers"`
+	WrittenBytes    int64            `json:"written_bytes"`
+	ReadBytes       int64            `json:"read_bytes"`
+	ApproximateSize int64            `json:"approximate_size"`
+	ApproximateKeys int64            `json:"approximate_keys"`
+
+	ReplicationStatus *ReplicationStatus `json:"replication_status,omitempty"`
+}
+
+// RegionPeer stores information of one peer.
+type RegionPeer struct {
+	ID        int64 `json:"id"`
+	StoreID   int64 `json:"store_id"`
+	IsLearner bool  `json:"is_learner"`
+}
+
+// RegionEpoch stores the information about its epoch.
+type RegionEpoch struct {
+	ConfVer int64 `json:"conf_ver"`
+	Version int64 `json:"version"`
+}
+
+// RegionPeerStat stores one field `DownSec` which indicates how long it's down than `RegionPeer`.
+type RegionPeerStat struct {
+	RegionPeer
+	DownSec int64 `json:"down_seconds"`
+}
+
+// ReplicationStatus represents the replication mode status of the region.
+type ReplicationStatus struct {
+	State   string `json:"state"`
+	StateID int64  `json:"state_id"`
+}
+
+func (s *tikvStore) getHotRegionIDs() (map[uint64]bool, error) {
+	pdHosts, err := s.EtcdAddrs()
+	if err != nil {
+		return nil, err
+	}
+	if len(pdHosts) == 0 {
+		return nil, errors.New("pd unavailable")
+	}
+	req, err := http.NewRequest("GET", util.InternalHTTPSchema()+"://"+pdHosts[0]+pdapi.HotRead, nil)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	resp, err := util.InternalHTTPClient().Do(req)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	defer func() {
+		err = resp.Body.Close()
+		if err != nil {
+			logutil.BgLogger().Error("close body failed", zap.Error(err))
+		}
+	}()
+	var regionResp StoreHotRegionInfos
+	err = json.NewDecoder(resp.Body).Decode(&regionResp)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	metricCnt := 0
+	for _, hotRegions := range regionResp.AsLeader {
+		metricCnt += len(hotRegions.RegionsStat)
+	}
+	hotRegionIDs := make(map[uint64]bool, metricCnt)
+	for _, hotRegions := range regionResp.AsLeader {
+		for _, region := range hotRegions.RegionsStat {
+			hotRegionIDs[region.RegionID] = true
+		}
+	}
+	return hotRegionIDs, nil
+}
+
+func (s *tikvStore) getRegionPendingPeers() (map[int64][]int64, error) {
+	var regionsInfo RegionsInfo
+	pdHosts, err := s.EtcdAddrs()
+	if err != nil {
+		return nil, err
+	}
+	if len(pdHosts) == 0 {
+		return nil, errors.New("pd unavailable")
+	}
+	req, err := http.NewRequest("GET", util.InternalHTTPSchema()+"://"+pdHosts[0]+pdapi.Regions, nil)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	resp, err := util.InternalHTTPClient().Do(req)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	defer func() {
+		err = resp.Body.Close()
+		if err != nil {
+			logutil.BgLogger().Error("close body failed", zap.Error(err))
+		}
+	}()
+
+	err = json.NewDecoder(resp.Body).Decode(&regionsInfo)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	pendingPeers := make(map[int64][]int64, regionsInfo.Count)
+	for _, region := range regionsInfo.Regions {
+		pp := make([]int64, 0, len(region.PendingPeers))
+		for _, pendingPeer := range region.PendingPeers {
+			pp = append(pp, pendingPeer.ID)
+		}
+		pendingPeers[region.ID] = pp
+	}
+	return pendingPeers, nil
+}
+
+func (s *tikvStore) refreshRegionCache() {
+	for {
+		select {
+		case <-time.NewTicker(5 * time.Second).C:
+			hotRegionIDs, err := s.getHotRegionIDs()
+			if err != nil {
+				logutil.BgLogger().Error("tikvStore refresh region cache failed", zap.Error(err))
+				continue
+			}
+			s.regionCache.RefreshHotReadRegions(hotRegionIDs)
+
+			regionPendingPeers, err := s.getRegionPendingPeers()
+			if err != nil {
+				logutil.BgLogger().Error("tikvStore refresh region pending peers failed", zap.Error(err))
+				continue
+			}
+			s.regionCache.RefreshRegionPendingPeers(regionPendingPeers)
+		case <-s.Closed():
+			return
+		}
+	}
 }
 
 func (s *tikvStore) runSafePointChecker() {

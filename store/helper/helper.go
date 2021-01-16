@@ -153,15 +153,10 @@ func (h *Helper) FetchHotRegion(rw string) (map[uint64]RegionMetric, error) {
 		metricCnt += len(hotRegions.RegionsStat)
 	}
 	metric := make(map[uint64]RegionMetric, metricCnt)
-	hotRegionIDs := make(map[uint64]bool, metricCnt)
 	for _, hotRegions := range regionResp.AsLeader {
 		for _, region := range hotRegions.RegionsStat {
 			metric[region.RegionID] = RegionMetric{FlowBytes: uint64(region.FlowBytes), MaxHotDegree: region.HotDegree}
-			hotRegionIDs[region.RegionID] = true
 		}
-	}
-	if rw == pdapi.HotRead {
-		h.RegionCache.RefreshHotReadRegions(hotRegionIDs)
 	}
 	return metric, nil
 }
@@ -632,17 +627,6 @@ func bytesKeyToHex(key []byte) string {
 func (h *Helper) GetRegionsInfo() (*RegionsInfo, error) {
 	var regionsInfo RegionsInfo
 	err := h.requestPD("GET", pdapi.Regions, nil, &regionsInfo)
-	if err == nil {
-		pendingPeers := make(map[int64][]int64, regionsInfo.Count)
-		for _, region := range regionsInfo.Regions {
-			pp := make([]int64, 0, len(region.PendingPeers))
-			for _, pendingPeer := range region.PendingPeers {
-				pp = append(pp, pendingPeer.ID)
-			}
-			pendingPeers[region.ID] = pp
-		}
-		h.RegionCache.RefreshRegionPendingPeers(pendingPeers)
-	}
 	return &regionsInfo, err
 }
 

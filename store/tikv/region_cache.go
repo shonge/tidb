@@ -319,12 +319,14 @@ func NewRegionCache(pdClient pd.Client) *RegionCache {
 // refresh hot read region
 func (c *RegionCache) RefreshHotReadRegions(hotReadRegions map[uint64]bool) {
 	c.hotMu.Lock()
+	logutil.BgLogger().Warn("RefreshHotReadRegions() happen")
 	c.hotMu.hotReadRegions = hotReadRegions
 	c.hotMu.Unlock()
 }
 
 func (c *RegionCache) RefreshRegionPendingPeers(pendingPeers map[int64][]int64) {
 	c.pendingMu.Lock()
+	logutil.BgLogger().Warn("RefreshRegionPendingPeers() happen")
 	c.pendingMu.regionPendingPeers = pendingPeers
 	c.pendingMu.Unlock()
 }
@@ -449,13 +451,15 @@ func (c *RegionCache) GetTiKVRPCContext(bo *Backoffer, id RegionVerID, replicaRe
 	}
 
 	if c.isHotRegion(id) {
-		store, peer, accessIdx, storeIdx = cachedRegion.FollowerStorePeer(regionStore, followerStoreSeed, options)
+		logutil.BgLogger().Warn("GetTiKVRPCContext() region is hot", zap.Uint64("region", id.id))
+		store, peer, accessIdx, storeIdx = cachedRegion.AnyStorePeer(regionStore, followerStoreSeed, options)
 		if c.isPendingPeer(id.id, peer) {
+			logutil.BgLogger().Warn("GetTiKVRPCContext() peer is pending", zap.Uint64("region", id.id), zap.Uint64("peer", peer.Id))
 			store, peer, accessIdx, storeIdx = cachedRegion.WorkStorePeer(regionStore)
 		}
+	} else {
+		store, peer, accessIdx, storeIdx = cachedRegion.WorkStorePeer(regionStore)
 	}
-	// TODO store stat strategy.
-	store, peer, accessIdx, storeIdx = cachedRegion.WorkStorePeer(regionStore)
 
 	addr, err := c.getStoreAddr(bo, cachedRegion, store, storeIdx)
 	if err != nil {
